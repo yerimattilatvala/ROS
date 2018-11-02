@@ -58,6 +58,7 @@ from baxter_interface import CHECK_VERSION
 from random import uniform
 from random import randint
 from math import atan2
+from math import sqrt
 import numpy as np
 
 LIMIT_DOWN_X = 0.4
@@ -80,9 +81,10 @@ ORIENTATION1 = Quaternion(x=0,
                         z=0,
                         w=0)
 
-#BLOCK = 'block'
+BLOCK = 'block'
 BOWL = 'bowl'
 ROBOBO = 'mobile'
+GOAL = 'goal'
 
 class Simulator():
 
@@ -102,9 +104,9 @@ class Simulator():
         self._init_state = self._rs.state().enabled
         print("***Activando robot... ")
         self._rs.enable()
-        '''self.set_neutral()
+        self.set_neutral()
         self._left_gripper.calibrate()
-        self.gripper_close()'''
+        self.gripper_close()
         self._reached_position = False
         self._running = False
         self._found = False
@@ -115,6 +117,7 @@ class Simulator():
         self._bowl_pose = None
         self._get_poses = True
         self._grab = False
+        self._robot_catch_block = False
 
     def _get_rotation(self, msg):
         self._mobile_position_x = msg.pose.pose.position.x
@@ -130,37 +133,36 @@ class Simulator():
         if self._publisher is not None: 
             self._publisher.publish(msg)
 
-    def _callback(self, msg):
-        if self._get_poses:
-            pos = 0
-            self._get_poses = False
-            for x in msg.name:
-                if x == BLOCK:
-                    pose = msg.pose[pos]
-                    print 'OBTENIENDO POSICION : CUBO ....'
-                    if self._i == 0:
-                        block_x = pose.position.x + CORR_X
-                        self._i +=1
-                    else:
-                        block_x = pose.position.x - CORR_X
-                    block_y = pose.position.y + CORR_Y
-                    self._block_pose = Pose(position=Point(x=block_x, 
-                                                y=block_y, 
-                                                z=POZ_Z), 
-                                                orientation=ORIENTATION1)
-                    print 'POSICION CUBO : ', self._block_pose 
-                elif x == BOWL:
-                    pose = msg.pose[pos]
-                    print 'OBTENIENDO POSICION : BOWL....'
-                    bowl_x = pose.position.x
-                    bowl_y = pose.position.y
-                    bowl_z = POZ_Z
-                    self._bowl_pose = Pose(position=Point(x=bowl_x, 
-                                                y=bowl_y, 
-                                                z=bowl_z), 
-                                                orientation=ORIENTATION1)               
-                    print 'POSICION BOWL : ', self._bowl_pose
-                pos += 1
+    def _read_position(self, msg):
+        pos = 0
+        self._get_poses = False
+        for x in msg.name:
+            if x == BLOCK:
+                pose = msg.pose[pos]
+                print 'OBTENIENDO POSICION : CUBO ....'
+                if self._i == 0:
+                    block_x = pose.position.x + CORR_X
+                    self._i +=1
+                else:
+                    block_x = pose.position.x - CORR_X
+                block_y = pose.position.y + CORR_Y
+                self._block_pose = Pose(position=Point(x=block_x, 
+                                            y=block_y, 
+                                            z=POZ_Z), 
+                                            orientation=ORIENTATION1)
+                print 'POSICION CUBO : ', self._block_pose 
+            elif x == GOAL:
+                pose = msg.pose[pos]
+                print 'OBTENIENDO POSICION : GOAL....'
+                bowl_x = pose.position.x
+                bowl_y = pose.position.y
+                bowl_z = POZ_Z
+                self._bowl_pose = Pose(position=Point(x=bowl_x, 
+                                            y=bowl_y, 
+                                            z=bowl_z), 
+                                            orientation=ORIENTATION1)               
+                print 'POSICION BOWL : ', self._bowl_pose
+            pos += 1
         #rospy.loginfo("The ball is in the position : x:{}, y:{}, z:{}".format(self._pos_x, self._pos_y, self._pos_z))
 
     def _unregister_all_subscriber(self):
@@ -183,7 +185,7 @@ class Simulator():
     def _reset_models(self):
         model_state = ModelState()
         model_state_bowl = ModelState()
-        model_state_bowl.model_name = BOWL
+        model_state_bowl.model_name = GOAL
         model_state.model_name = BLOCK
         model_state_bowl.pose.position.x = self._bowl_pose.position.x
         model_state_bowl.pose.position.y = self._bowl_pose.position.y
@@ -356,6 +358,15 @@ class Simulator():
         except Exception as _:
             print '***ERROR -> CALCULANDO SIGUIENTE POSE...'
         
+    def _mobile_near_block(self):
+        near = False
+        distance_to_block_x = abs(self._block_pose.position.x - self._mobile_position_x)
+        distance_to_block_y = abs(self._block_pose.position.y - self._mobile_position_y)
+        distance = sqrt((distance_to_block_x**2) + (distance_to_block_y**2))
+        if distance < 0.15:
+            near = True
+        return near
+
     def is_over(self, pose):
         over = False
         if self._block_pose is not None and self._bowl_pose is not None:
@@ -392,9 +403,9 @@ class Simulator():
         self._subs.append(subscriber)
 
     def _run_subscribers(self): 
-        #sub1 = rospy.Subscriber("/gazebo/model_states", ModelStates, self._callback)
+        sub1 = rospy.Subscriber("/gazebo/model_states", ModelStates, self._read_position)
         sub2 = rospy.Subscriber('/odom', Odometry, self._get_rotation)
-        #self._add_subscriber(sub1)
+        self._add_subscriber(sub1)
         self._add_subscriber(sub2)
 
     def _run_publisher(self):
@@ -432,6 +443,22 @@ class Simulator():
         y = self._mobile_target_position_y - self._mobile_position_y
         self._angle_target = atan2(y, x)
 
+    def _block_on_robot(self):
+        model_state = ModelState()
+        model_state.model_name = BLOCK
+        print 'MOVE BLOCK...'
+        model_state.pose.position.x = self._mobile_position_x
+        model_state.pose.position.y = self._mobile_position_y
+        model_state.pose.position.z = POS_Z
+        model_state.pose.orientation = ORIENTATION1
+        model_state.reference_frame = 'base'
+        rospy.wait_for_service('/gazebo/set_model_state')
+        try:
+            sms = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+            sms(model_state)
+        except rospy.ServiceException, e:
+            print "Service call failed: %s"%e
+
     def _move_mobile_robot_randomly(self):
         if self._running:
             self._generate_random_pose_to_mobile_robot()
@@ -457,10 +484,19 @@ class Simulator():
                         position_x = abs(self._mobile_target_position_x - self._mobile_position_x)
                         position_y = abs(self._mobile_target_position_y - self._mobile_position_y)
                         print 'DISTANCES : X : {0}, Y : {1}'.format(position_x, position_y)
-                        if position_x < 0.1 and position_y < 0.1:
-                            self._stop()
-                            print 'PUNTO OBJETIVO ALCANZADO'
-                            self._reached_position = True
+                        if self._robot_catch_block:
+                            if (position_x < 0.1 and position_y < 0.1):
+                                self._stop()
+                                print 'PUNTO OBJETIVO ALCANZADO'
+                        else:
+                            if (position_x < 0.1 and position_y < 0.1) or self._mobile_near_block():
+                                self._stop()
+                                print 'PUNTO OBJETIVO ALCANZADO'
+                                if self._mobile_near_block():
+                                    self._block_on_robot()
+                                    self._robot_catch_block = True
+                            
+                        self._reached_position = True
                 else:
                     self._angle_beetwen_2_points()
                     if abs(self._angle_target - self._mobile_yaw) < 0.2:
@@ -488,10 +524,6 @@ class Simulator():
                 self._reboot()'''
 
     def delete_gazebo_models(self):
-        # This will be called on ROS Exit, deleting Gazebo models
-        # Do not wait for the Gazebo Delete Model service, since
-        # Gazebo should already be running. If the service is not
-        # available since Gazebo has been killed, it is fine to error out
         try:
             self._unregister_all()
             self._run = False
@@ -500,7 +532,7 @@ class Simulator():
             delete_model = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)
             delete_model("table")
             delete_model("block")
-            #delete_model("bowl")
+            delete_model(GOAL)
             delete_model("mobile")
             self.clean_shutdown()
             rospy.sleep(1.0)
@@ -508,7 +540,7 @@ class Simulator():
             rospy.loginfo("Delete Model service call failed: {0}".format(e))
 
 def load_gazebo_models( table_reference_frame="world",
-                       block_pose=Pose(position=Point(x=0.6,y=-0.2, z=0.1)),
+                       block_pose=Pose(position=Point(x=0.6,y=0.1, z=0.1)),
                        block_reference_frame="base"):
     p0 = Pose(position=Point(x=0.6, y=0.0, z=-0.2), orientation=Quaternion(x=0,y=0,z=-1,w=1))
     p1 = Pose(position=Point(x=0.5, y=0.2, z=0.1))
@@ -524,9 +556,9 @@ def load_gazebo_models( table_reference_frame="world",
     block_xml = ''
     with open (model_path + "block/model.urdf", "r") as block_file:
         block_xml=block_file.read().replace('\n', '')
-    '''bowl_xml = ''
-    with open (model_path + "bowl/model.sdf", "r") as bowl_file:
-        bowl_xml=bowl_file.read().replace('\n', '')'''
+    goal_xml = ''
+    with open (model_path + "goal/model.urdf", "r") as bowl_file:
+        goal_xml=bowl_file.read().replace('\n', '')
     mobile_robot_xml = ''
     with open (model_path + "my_robot1/model.sdf", "r") as mobile_robot_file:
         mobile_robot_xml=mobile_robot_file.read().replace('\n', '')
@@ -543,6 +575,7 @@ def load_gazebo_models( table_reference_frame="world",
         spawn_urdf = rospy.ServiceProxy('/gazebo/spawn_urdf_model', SpawnModel)
         spawn_urdf("block", block_xml, "/",
                                block_pose, block_reference_frame)
+        spawn_urdf(GOAL, goal_xml, "/", p1, "base")
     except rospy.ServiceException, e:
         rospy.logerr("Spawn URDF service call failed: {0}".format(e))
     print '***Entorno cargado.'
