@@ -30,9 +30,13 @@
 """
 Baxter and Mobile Robot Experiment
 """
+import sys
+# Se cargan las rutas necesarias en el PYTHONPATH para poder llamar al modulo desde el simulador
+sys.path.append('/opt/ros/kinetic/lib/python2.7/dist-packages/')
+sys.path.append('/home/yeray/ros_ws/devel/lib/python2.7/dist-packages/')
+sys.path.append('/home/yeray/Escritorio/Experimento1_4/')
 import argparse
 import struct
-import sys
 import copy
 import rospy
 import rospkg
@@ -59,7 +63,10 @@ from random import uniform
 from random import randint
 from math import atan2
 from math import sqrt
+from math import pow
 import numpy as np
+import thread
+from baxter_experiment_facade import BaxterExperiment
 
 LIMIT_DOWN_X = 0.4
 LIMIT_UP_X = 0.6
@@ -72,14 +79,16 @@ POS_Z = 0.9
 PROX_X = 0.09
 PROX_Y = 0.09
 DIST = 0.05
-MOBILE_POSITION_X_MIN = 0.4
-MOBILE_POSITION_X_MAX = 0.75
+MOBILE_INIT_POSE = Pose(position=Point(x=0.5, y=-0.3, z=0.1))
+MOBILE_POSITION_X_MIN = 0.35
+MOBILE_POSITION_X_MAX = 0.7
 MOBILE_POSITION_Y_MIN = -0.4
 MOBILE_POSITION_Y_MAX = 0.4
 ORIENTATION1 = Quaternion(x=0,
                         y=1,
                         z=0,
                         w=0)
+APROX_X_MOBILE = 0.075
 
 BLOCK = 'block'
 BOWL = 'bowl'
@@ -99,14 +108,18 @@ class Simulator():
         ns = "ExternalTools/" + 'left' + "/PositionKinematicsNode/IKService"                             
         self._ros = rospy.ServiceProxy(ns, SolvePositionIK)                                              
         rospy.wait_for_service(ns, 5.0)  
-        print("***Obteniendo estado del baxter... ")
+        rospy.loginfo("***Obteniendo estado del baxter... ")
         self._rs = baxter_interface.RobotEnable(CHECK_VERSION)
         self._init_state = self._rs.state().enabled
-        print("***Activando robot... ")
+        rospy.loginfo("***Activando robot... ")
+        self._set_model = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+        rospy.wait_for_service('/gazebo/set_model_state', 5.0)
         self._rs.enable()
         self.set_neutral()
         self._left_gripper.calibrate()
         self.gripper_close()
+        self._pos_block = None
+        self._pos_goal = None
         self._reached_position = False
         self._running = False
         self._found = False
@@ -114,11 +127,89 @@ class Simulator():
         self._run = True
         self._rebooting = False
         self._block_pose = None
-        self._bowl_pose = None
+        self._goal_pose = None
         self._get_poses = True
         self._grab = False
         self._robot_catch_block = False
+        self._block_on_baxter = False
+        self._place_block = False
+        self._catchin_block_of_mobile = False
+        self._catching_block = False
+        self._reward = 0
+        self._block_position = None
 
+    def get_sensorization(self):
+        """Return a sensorization vector with the distances between the ball and the robots' actuators and the reward"""
+        dist_rob_ball = self._get_distance_robobo_ball()
+        dist_baxt_larm_ball = self._get_distance_left_baxter_arm_block()
+        dist_ball_box1 = self._get_distance_block_goal()
+
+        return dist_rob_ball, dist_baxt_larm_ball, dist_ball_box1 
+
+    def _get_distance(self, x1, y1, x2, y2):
+        """Return the distance between two points"""
+        return sqrt(pow(x2 - x1, 2) + (pow(y2 - y1, 2)))
+
+    def _get_distance_robobo_ball(self):
+        x1 = self._mobile_position_x
+        y1 = self._mobile_position_y
+        x2 = self._block_pose.position.x
+        y2 = self._block_pose.position.y
+
+        return self._get_distance(x1, y1, x2, y2)
+
+    def _get_distance_block_goal(self):
+        x1 = self._block_pose.position.x
+        y1 = self._block_pose.position.y
+        x2 = self._goal_pose.position.x
+        y2 = self._goal_pose.position.y
+
+        return self._get_distance(x1, y1, x2, y2)
+
+    def _get_distance_left_baxter_arm_block(self):
+        x1 = self._baxter_target_position.position.x
+        y1 = self._baxter_target_position.position.y
+        x2 = self._block_pose.position.x
+        y2 = self._block_pose.position.y
+
+        return self._get_distance(x1, y1, x2, y2)
+
+    def get_reward(self):
+        return self._reward
+
+    def restart_scenario(self):
+        self._reset_models()
+
+    def apply_action(self, action):
+        pass
+
+    def baxter_larm_get_pos(self):
+        return self._baxter_target_position.position.x, self._baxter_target_position.position.y
+
+    def baxter_larm_get_angle(self):
+        pass
+
+    def baxter_rarm_get_pos(self):
+        pass
+
+    def baxter_rarm_get_angle(self):
+        pass
+
+    def robobo_get_pos(self):
+        return self._mobile_position_x, self._mobile_position_y
+
+    def robobo_get_angle(self):
+        pass
+
+    def ball_get_pos(self):
+        return tuple(self._block_pose.position.x, self._block_pose.position.y)
+
+    def ball_position(self):
+        return self._block_position
+
+    def box_get_pos(self):
+        return tuple(self._goal_pose.position.x, self._goal_pose.position.y)
+        
     def _get_rotation(self, msg):
         self._mobile_position_x = msg.pose.pose.position.x
         self._mobile_position_y = msg.pose.pose.position.y
@@ -133,37 +224,50 @@ class Simulator():
         if self._publisher is not None: 
             self._publisher.publish(msg)
 
-    def _read_position(self, msg):
+    def _get_coordinates(self, msg):
         pos = 0
-        self._get_poses = False
-        for x in msg.name:
-            if x == BLOCK:
-                pose = msg.pose[pos]
-                print 'OBTENIENDO POSICION : CUBO ....'
-                if self._i == 0:
-                    block_x = pose.position.x + CORR_X
-                    self._i +=1
-                else:
-                    block_x = pose.position.x - CORR_X
-                block_y = pose.position.y + CORR_Y
-                self._block_pose = Pose(position=Point(x=block_x, 
-                                            y=block_y, 
-                                            z=POZ_Z), 
-                                            orientation=ORIENTATION1)
-                print 'POSICION CUBO : ', self._block_pose 
-            elif x == GOAL:
-                pose = msg.pose[pos]
-                print 'OBTENIENDO POSICION : GOAL....'
-                bowl_x = pose.position.x
-                bowl_y = pose.position.y
-                bowl_z = POZ_Z
-                self._bowl_pose = Pose(position=Point(x=bowl_x, 
-                                            y=bowl_y, 
-                                            z=bowl_z), 
-                                            orientation=ORIENTATION1)               
-                print 'POSICION BOWL : ', self._bowl_pose
+        for name in msg.name:
+            if name == BLOCK:
+                self._pos_block = pos
+                self._get_block_coordinates(msg)
+            elif name == GOAL:
+                self._pos_goal = pos
+                self._get_goal_coordinates(msg)
             pos += 1
-        #rospy.loginfo("The ball is in the position : x:{}, y:{}, z:{}".format(self._pos_x, self._pos_y, self._pos_z))
+
+    def _get_block_coordinates(self, msg):
+        pose = msg.pose[self._pos_block]
+        x1 = 0
+        y1 = 0
+        if self._block_pose is not None:
+            x1 = round(self._block_pose.position.x, 3)
+            y1 = round(self._block_pose.position.y, 3)
+        x2 = round(pose.position.x, 3)
+        y2 = round(pose.position.y, 3)
+        if x1 != x2 and y1 != y2:
+            if self._i == 0:
+                block_x = pose.position.x - CORR_X
+            else:
+                block_x = pose.position.x + CORR_X
+            block_y = pose.position.y + CORR_Y
+            self._block_pose = Pose(position=Point(x=block_x, y=block_y, z=POZ_Z), 
+                                    orientation=ORIENTATION1)
+        #rospy.loginfo('POSICION CUBO = {0} '.format(self._block_pose))  
+
+    def _get_goal_coordinates(self, msg):
+        pose = msg.pose[self._pos_goal]
+        goal_x = pose.position.x
+        goal_y = pose.position.y
+        goal_z = POZ_Z
+        self._goal_pose = Pose(position=Point( x=goal_x, y=goal_y, z=goal_z), 
+                               orientation=ORIENTATION1)    
+        #rospy.loginfo('POSICION GOAL = {0} '.format(self._bowl_pose)) 
+
+    def _read_position(self, msg):
+        if self._pos_block is None and self._pos_goal is None:
+            self._get_coordinates(msg)
+        else:
+            self._get_block_coordinates(msg)
 
     def _unregister_all_subscriber(self):
         for publisher in self._subs:
@@ -323,6 +427,7 @@ class Simulator():
 
     def _reboot(self):
         if self._rebooting:
+            self._i +=1
             self.set_neutral()
             self._reset_models()
             rospy.sleep(2.0)
@@ -349,55 +454,82 @@ class Simulator():
                         self._retract()
                         self._grab = True
                 else:
-                    if self._bowl_pose is not None:
-                        self._approach(self._bowl_pose)
+                    if self._goal_pose is not None:
+                        self._approach(self._goal_pose)
                         self._grab = False
                         self._rebooting = True
                         self.gripper_open()
 
         except Exception as _:
-            print '***ERROR -> CALCULANDO SIGUIENTE POSE...'
+            rospy.logerr('***ERROR : CALCULANDO NUEVA POSE...')
         
     def _mobile_near_block(self):
         near = False
-        distance_to_block_x = abs(self._block_pose.position.x - self._mobile_position_x)
+        distance_to_block_x = abs(self._block_pose.position.x - (self._mobile_position_x + APROX_X_MOBILE))
         distance_to_block_y = abs(self._block_pose.position.y - self._mobile_position_y)
-        distance = sqrt((distance_to_block_x**2) + (distance_to_block_y**2))
-        if distance < 0.15:
+        #distance = sqrt((distance_to_block_x**2) + (distance_to_block_y**2))
+        #if distance < 0.15:
+        if distance_to_block_x < 0.15 and distance_to_block_y < 0.15:
             near = True
         return near
 
-    def is_over(self, pose):
-        over = False
-        if self._block_pose is not None and self._bowl_pose is not None:
-            if self._grab:
-                print 'BOWL POSE : ', self._bowl_pose
-                x1 = self._bowl_pose.position.x
-                y1 = self._bowl_pose.position.y
+    def _set_element_to_pose(self, name, pose, reference_frame='base'):
+        model_state = ModelState()
+        model_state.model_name = name
+        model_state.pose= pose
+        model_state.reference_frame = reference_frame
+        rospy.loginfo('Colocando [{0}] en posicion [{1}]'.format(name, pose))
+        self._set_model(model_state)
+        rospy.loginfo('Colocado [{0}]'.format(name))
+
+    def _leave_block(self):
+        self._stop()
+        self.set_neutral()
+        #self._set_element_to_pose(ROBOBO, MOBILE_INIT_POSE)
+        if self._i > 0:
+            pos_x = self._baxter_target_position.position.x - CORR_X
+        else:
+            pos_x = self._baxter_target_position.position.x + CORR_X
+        block_pose = Pose(position=Point(pos_x, self._baxter_target_position.position.y - CORR_Y, 0.1),
+                          orientation=ORIENTATION1)
+        self._set_element_to_pose(BLOCK, block_pose)
+        self.pick(self._baxter_target_position)
+        self._block_on_baxter = True
+
+    def _baxter_over_block(self):
+        if self._robot_catch_block and self._block_on_baxter == False:
+            x_distance = abs(self._baxter_target_position.position.x - self._mobile_target_position_x)
+            y_distance = abs(self._baxter_target_position.position.y - self._mobile_target_position_y)
+            distance = sqrt((x_distance**2) + (y_distance**2))
+            if distance < 0.15:
+                self._catchin_block_of_mobile = True
+        else:
+            if self._block_on_baxter:
+                rospy.loginfo('GOAL POSE = {0}'.format(self._goal_pose))
+                x1 = self._goal_pose.position.x
+                y1 = self._goal_pose.position.y
             else:
-                print '---BLOCK POSE : ', self._block_pose
+                rospy.loginfo('BLOCK POSE = {0}'.format(self._block_pose))
                 x1 = self._block_pose.position.x
                 y1 = self._block_pose.position.y
-            x2 = pose.position.x
-            y2 = pose.position.y
-            x = np.abs(x1 - x2)
-            y = np.abs(y1 - y2)
+            x = abs(x1 - self._baxter_target_position.position.x)
+            y = abs(y1 - self._baxter_target_position.position.y)
             distance = np.sqrt(x**2 + y**2)
-            print 'X : {0}, Y : {1}'.format(x,y)
-            print 'DISTANCE : ', distance
+            rospy.loginfo('X : {0}, Y : {1}'.format(x,y))
+            rospy.loginfo('DISTANCE : {0}'.format(distance))
             if x <= PROX_X and y <= PROX_Y:
-                over = True
-            #if distance <= DIST:
-        return over
+                if self._block_on_baxter:
+                    self._place_block = True
+                else:
+                    self._catching_block = True
 
     def _generate_baxter_poses(self):
         x = round(uniform(LIMIT_DOWN_X, LIMIT_UP_X), 3)
         y = round(uniform(LIMIT_DOWN_Y, LIMIT_UP_Y), 3)
-        pose =  Pose(position=Point(x=x, 
+        self._baxter_target_position =  Pose(position=Point(x=x, 
                                     y=y, 
                                     z=POZ_Z), 
                                     orientation=ORIENTATION1)
-        return pose
 
     def _add_subscriber(self, subscriber):
         self._subs.append(subscriber)
@@ -443,77 +575,83 @@ class Simulator():
         y = self._mobile_target_position_y - self._mobile_position_y
         self._angle_target = atan2(y, x)
 
-    def _block_on_robot(self):
-        model_state = ModelState()
-        model_state.model_name = BLOCK
-        print 'MOVE BLOCK...'
-        model_state.pose.position.x = self._mobile_position_x
-        model_state.pose.position.y = self._mobile_position_y
-        model_state.pose.position.z = POS_Z
-        model_state.pose.orientation = ORIENTATION1
-        model_state.reference_frame = 'base'
-        rospy.wait_for_service('/gazebo/set_model_state')
-        try:
-            sms = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
-            sms(model_state)
-        except rospy.ServiceException, e:
-            print "Service call failed: %s"%e
-
     def _move_mobile_robot_randomly(self):
-        if self._running:
-            self._generate_random_pose_to_mobile_robot()
-            is_rotating = False
-            run = False
-            is_runing = False
-            while not self._reached_position:
-                print 'CURRENT POSITION : ({0},{1}) || TARGET : ({2},{3})'.format(self._mobile_position_x,
-                                                                                self._mobile_position_y,
-                                                                                self._mobile_target_position_x,
-                                                                                self._mobile_target_position_y)
-                if is_rotating == False:
-                    if self._mobile_target_position_y > 0:
-                        self._rotate(potence=-0.1)
-                    else:
-                        self._rotate(potence=0.1)
-                    is_rotating = True
-                if run:
-                    if is_runing == False:
-                        self._go_forward()
-                        is_runing = True
-                    else:
-                        position_x = abs(self._mobile_target_position_x - self._mobile_position_x)
-                        position_y = abs(self._mobile_target_position_y - self._mobile_position_y)
-                        print 'DISTANCES : X : {0}, Y : {1}'.format(position_x, position_y)
-                        if self._robot_catch_block:
-                            if (position_x < 0.1 and position_y < 0.1):
-                                self._stop()
-                                print 'PUNTO OBJETIVO ALCANZADO'
-                        else:
-                            if (position_x < 0.1 and position_y < 0.1) or self._mobile_near_block():
-                                self._stop()
-                                print 'PUNTO OBJETIVO ALCANZADO'
-                                if self._mobile_near_block():
-                                    self._block_on_robot()
-                                    self._robot_catch_block = True
-                            
-                        self._reached_position = True
+        is_rotating = False
+        run = False
+        is_runing = False
+        while not self._reached_position:
+            rospy.loginfo('CURRENT POSITION : ({0},{1}) || TARGET : ({2},{3}) \n'.format(self._mobile_position_x,
+                                                                                      self._mobile_position_y,
+                                                                                      self._mobile_target_position_x,
+                                                                                      self._mobile_target_position_y))
+            distance_to_block_x = abs(self._block_pose.position.x - self._mobile_position_x)
+            distance_to_block_y = abs(self._block_pose.position.y - self._mobile_position_y)
+            rospy.loginfo('DISTANCE X : {0}, Y : {1}'.format(distance_to_block_x, distance_to_block_y))
+            if is_rotating == False:
+                if self._mobile_target_position_y > 0:
+                    self._rotate(potence=-0.1)
                 else:
-                    self._angle_beetwen_2_points()
-                    if abs(self._angle_target - self._mobile_yaw) < 0.2:
-                        self._stop()
-                        run = True
-                self._rate.sleep()
-            self._reached_position = False
+                    self._rotate(potence=0.1)
+                is_rotating = True
+            if run:
+                if is_runing == False:
+                    self._go_forward()
+                    is_runing = True
+                else:
+                    position_x = abs(self._mobile_target_position_x - self._mobile_position_x)
+                    position_y = abs(self._mobile_target_position_y - self._mobile_position_y)
+                    rospy.logdebug('DISTANCES : X : {0}, Y : {1}'.format(position_x, position_y))
+                    if self._robot_catch_block:
+                        if (position_x < 0.1 and position_y < 0.1):
+                            self._stop()
+                            rospy.loginfo('PUNTO OBJETIVO ALCANZADO')
+                    else:
+                        if (position_x < 0.1 and position_y < 0.1) or self._mobile_near_block():
+                            self._stop()
+                            rospy.loginfo('PUNTO OBJETIVO ALCANZADO')
+                            if self._mobile_near_block():
+                                pose = Pose(position=Point(self._mobile_position_x, self._mobile_position_y, POS_Z),
+                                            orientation=ORIENTATION1)
+                                self._set_element_to_pose(BLOCK, pose)
+                                self._robot_catch_block = True
+                    self._reached_position = True
+            else:
+                self._angle_beetwen_2_points()
+                if abs(self._angle_target - self._mobile_yaw) < 0.2:
+                    self._stop()
+                    run = True
+            self._rate.sleep()
+        self._reached_position = False
+
+    def _run_simulation(self):
+
+        self._generate_baxter_poses()
+        self._generate_random_pose_to_mobile_robot()
+        self._baxter_over_block()
+
+        if self._place_block:
+            self.place(self._goal_pose)
+        elif self._catching_block:
+            self.pick(self._block_pose)
+            self._block_on_baxter = True
+            self._robot_catch_block = True
+        elif self._catchin_block_of_mobile:
+            self._leave_block()
+        else:
+            self._approach(self._baxter_target_position)
+        self._move_mobile_robot_randomly()
+            
 
     def run(self):
         self._run_subscribers()
         self._run_publisher()
-        rospy.sleep(2)
+        rospy.sleep(1)
         print '***Pulsa Ctrl-C para parar...'
         while not rospy.is_shutdown():
-            self._running = True
+            self._run_simulation()
+            '''self._running = True
             self._move_mobile_robot_randomly()
-            '''if self._run:
+            if self._run:
                 pose = self._generate_baxter_poses()
                 self._approach(pose)
 
@@ -545,7 +683,7 @@ def load_gazebo_models( table_reference_frame="world",
     p0 = Pose(position=Point(x=0.6, y=0.0, z=-0.2), orientation=Quaternion(x=0,y=0,z=-1,w=1))
     p1 = Pose(position=Point(x=0.5, y=0.2, z=0.1))
     p2 = Pose(position=Point(x=0.5, y=-0.3, z=0.1))
-    print '***Cargando modelos.....'
+    rospy.loginfo('***Cargando modelos.....')
     # Get Models' Path
     model_path = rospkg.RosPack().get_path('simulator')+"/models/"
     # Load Table SDF
@@ -578,18 +716,18 @@ def load_gazebo_models( table_reference_frame="world",
         spawn_urdf(GOAL, goal_xml, "/", p1, "base")
     except rospy.ServiceException, e:
         rospy.logerr("Spawn URDF service call failed: {0}".format(e))
-    print '***Entorno cargado.'
+    rospy.loginfo('***Entorno cargado.')
     rospy.sleep(1.0)
 
 
 def main():
-    print "***Inicializando nodo... " 
+    rospy.loginfo('***Inicializando nodo...') 
     rospy.init_node("baxterSimulatorExperiment")
     sim = Simulator(verbose=0)
     load_gazebo_models()
     rospy.on_shutdown(sim.delete_gazebo_models)
     sim.run()
-    print "***Terminado." 
+    rospy.loginfo('***Terminado.')
 
 if __name__ == '__main__':
     main()
